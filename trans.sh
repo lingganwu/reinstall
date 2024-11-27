@@ -1331,7 +1331,9 @@ install_nixos() {
 
     # 挂载分区，创建 swapfile
     mount_part_basic_layout /os /os/efi
-    create_swap $swap_size /os/swapfile
+    if [ "$swap_size" -gt 0 ]; then
+        create_swap "$swap_size" /os/swapfile
+    fi
 
     # 步骤
     # 1. 安装 nix (nix-xxx)
@@ -1959,7 +1961,7 @@ create_part() {
     elif is_use_cloud_image; then
         installer_part_size="$(get_cloud_image_part_size)"
         # 这几个系统不使用dd，而是复制文件
-        if [ "$distro" = centos ] || [ "$distro" = alma ] || [ "$distro" = rocky ] ||
+        if [ "$distro" = centos ] || [ "$distro" = almalinux ] || [ "$distro" = rocky ] ||
             [ "$distro" = oracle ] || [ "$distro" = redhat ] ||
             [ "$distro" = anolis ] || [ "$distro" = opencloudos ] || [ "$distro" = openeuler ] ||
             [ "$distro" = ubuntu ]; then
@@ -2472,7 +2474,7 @@ is_need_ucode_firmware() {
 
 get_ucode_firmware_pkgs() {
     case "$distro" in
-    centos | alma | rocky | oracle | redhat | anolis | opencloudos | openeuler) os=elol ;;
+    centos | almalinux | rocky | oracle | redhat | anolis | opencloudos | openeuler) os=elol ;;
     *) os=$distro ;;
     esac
 
@@ -3036,7 +3038,7 @@ get_os_fs() {
     case "$distro" in
     ubuntu) echo ext4 ;;
     anolis | openeuler) echo ext4 ;;
-    centos | alma | rocky | oracle | redhat) echo xfs ;;
+    centos | almalinux | rocky | oracle | redhat) echo xfs ;;
     opencloudos) echo xfs ;;
     esac
 }
@@ -3146,6 +3148,11 @@ del_default_user() {
     done < <(grep -v nologin$ "$os_dir/etc/passwd" | cut -d: -f1 | grep -v root)
 }
 
+is_el7_family() {
+    is_have_cmd_on_disk "$1" yum &&
+        ! is_have_cmd_on_disk "$1" dnf
+}
+
 install_qcow_by_copy() {
     info "Install qcow2 by copy"
 
@@ -3166,7 +3173,7 @@ install_qcow_by_copy() {
     connect_qcow
 
     # 镜像分区格式
-    # centos/rocky/alma/rhel: xfs
+    # centos/rocky/almalinux/rhel: xfs
     # oracle x86_64:          lvm + xfs
     # oracle aarch64 cloud:   xfs
 
@@ -3184,7 +3191,7 @@ install_qcow_by_copy() {
     os_part=$(lsblk /dev/nbd0p* --sort SIZE -no NAME,FSTYPE | grep -E 'ext4|xfs' | tail -1 | awk '{print $1}')
     efi_part=$(lsblk /dev/nbd0p* --sort SIZE -no NAME,PARTTYPE | grep -i "$EFI_UUID" | awk '{print $1}')
     # 排除前两个，再选择最大分区
-    # alma 9 boot 分区的类型不是规定的 uuid
+    # almalinux9 boot 分区的类型不是规定的 uuid
     # openeuler boot 分区是 fat 格式
     boot_part=$(lsblk /dev/nbd0p* --sort SIZE -no NAME,FSTYPE | grep -E 'ext4|xfs|fat' | awk '{print $1}' |
         grep -vx "$os_part" | grep -vx "$efi_part" | tail -1 | awk '{print $1}')
@@ -3307,26 +3314,31 @@ install_qcow_by_copy() {
         # selinux kdump
         disable_selinux_kdump /os
 
-        # centos7 删除 machine-id 后不会自动重建
+        # el7 删除 machine-id 后不会自动重建
         clear_machine_id /os
 
-        # el7 yum 可能会使用 ipv6，即使没有 ipv6 网络
-        if [ "$releasever" = 7 ]; then
+        # el7 forks 特殊处理
+        if is_el7_family /os; then
+            # centos 7 eol 换源
+            if [ -f /os/etc/yum.repos.d/CentOS-Base.repo ]; then
+                # 保持默认的 http 因为自带的 ssl 证书可能过期
+                if is_in_china; then
+                    mirror=mirror.nju.edu.cn/centos-vault
+                else
+                    mirror=vault.centos.org
+                fi
+                sed -Ei -e 's,(mirrorlist=),#\1,' \
+                    -e "s,#(baseurl=http://)mirror.centos.org,\1$mirror," /os/etc/yum.repos.d/CentOS-Base.repo
+            fi
+
+            # el7 yum 可能会使用 ipv6，即使没有 ipv6 网络
             if [ "$(cat /dev/netconf/eth*/ipv6_has_internet | sort -u)" = 0 ]; then
                 echo 'ip_resolve=4' >>/os/etc/yum.conf
             fi
-        fi
 
-        # centos 7 eol 特殊处理
-        if [ "$releasever" = 7 ] && [ -f /os/etc/yum.repos.d/CentOS-Base.repo ]; then
-            # 保持默认的 http 因为自带的 ssl 证书可能过期
-            if is_in_china; then
-                mirror=mirror.nju.edu.cn/centos-vault
-            else
-                mirror=vault.centos.org
-            fi
-            sed -Ei -e 's,(mirrorlist=),#\1,' \
-                -e "s,#(baseurl=http://)mirror.centos.org,\1$mirror," /os/etc/yum.repos.d/CentOS-Base.repo
+            # el7 安装 NetworkManager
+            # anolis 7 镜像自带 NetworkManager
+            chroot_dnf install NetworkManager
         fi
 
         # firmware + microcode
@@ -3334,12 +3346,6 @@ install_qcow_by_copy() {
             # shellcheck disable=SC2046
             chroot_dnf install $(get_ucode_firmware_pkgs)
         fi
-
-        # centos 7 安装 NetworkManager
-        if [ "$releasever" = 7 ]; then
-            chroot_dnf install NetworkManager
-        fi
-        # anolis 7 镜像自带 nm
 
         # 删除云镜像自带的 dhcp 配置，防止歧义
         # clout-init 网络配置在 /etc/sysconfig/network-scripts/
@@ -3355,7 +3361,7 @@ install_qcow_by_copy() {
 EOF
 
         # fstab 删除多余分区
-        # alma/rocky 镜像有 boot 分区
+        # almalinux/rocky 镜像有 boot 分区
         # oracle 镜像有 swap 分区
         sed -i '/[[:space:]]\/boot[[:space:]]/d' /os/etc/fstab
         sed -i '/[[:space:]]swap[[:space:]]/d' /os/etc/fstab
@@ -3422,7 +3428,7 @@ EOF
         fi
 
         # blscfg 启动项
-        # rocky/alma镜像是独立的boot分区，但我们不是
+        # rocky/almalinux镜像是独立的boot分区，但我们不是
         # 因此要添加boot目录
         if ls /os/boot/loader/entries/*.conf 2>/dev/null &&
             ! grep -q 'initrd /boot/' /os/boot/loader/entries/*.conf; then
@@ -4049,6 +4055,21 @@ get_filesize_mb() {
 }
 
 install_windows() {
+    get_wim_prop() {
+        wim=$1
+        property=$2
+
+        wiminfo "$wim" | grep -i "^$property:" | cut -d: -f2- | xargs
+    }
+
+    get_image_prop() {
+        wim=$1
+        index=$2
+        property=$3
+
+        wiminfo "$wim" "$index" | grep -i "^$property:" | cut -d: -f2- | xargs
+    }
+
     info "Process windows iso"
 
     apk add wimlib
@@ -4056,6 +4077,17 @@ install_windows() {
     download $iso /os/windows.iso
     mkdir -p /iso
     mount -o ro /os/windows.iso /iso
+
+    # 防止用了不兼容架构的 iso
+    boot_index=$(get_wim_prop /iso/sources/boot.wim 'Boot Index')
+    arch_wim=$(get_image_prop /iso/sources/boot.wim "$boot_index" 'Architecture' | to_lower)
+    if ! {
+        { [ "$(uname -m)" = "x86_64" ] && [ "$arch_wim" = x86_64 ]; } ||
+            { [ "$(uname -m)" = "x86_64" ] && [ "$arch_wim" = x86 ]; } ||
+            { [ "$(uname -m)" = "aarch64" ] && [ "$arch_wim" = arm64 ]; }
+    }; then
+        error_and_exit "The machine is $(uname -m), but the iso is $arch_wim."
+    fi
 
     if [ -e /iso/sources/install.esd ]; then
         iso_install_wim=/iso/sources/install.esd
@@ -4101,14 +4133,8 @@ install_windows() {
         done
     fi
 
-    get_boot_wim_prop() {
-        property=$1
-        wiminfo "/os/boot.wim" | grep -i "^$property:" | cut -d: -f2- | xargs
-    }
-
     get_selected_image_prop() {
-        property=$1
-        wiminfo "$iso_install_wim" "$image_name" | grep -i "^$property:" | cut -d: -f2- | xargs
+        get_image_prop "$iso_install_wim" "$image_name" "$1"
     }
 
     # PRODUCTTYPE:
@@ -4215,7 +4241,6 @@ install_windows() {
     # arch_dd    华为云驱动                   32   64
 
     # 将 wim 的 arch 转为驱动和应答文件的 arch
-    arch_wim=$(get_selected_image_prop Architecture | to_lower)
     case "$arch_wim" in
     x86)
         arch=x86
@@ -4233,15 +4258,6 @@ install_windows() {
         arch_dd=  # 华为云没有 arm64 驱动
         ;;
     esac
-
-    # 防止用了不兼容架构的 iso
-    if ! {
-        { [ "$(uname -m)" = "x86_64" ] && [ "$arch_wim" = x86_64 ]; } ||
-            { [ "$(uname -m)" = "x86_64" ] && [ "$arch_wim" = x86 ]; } ||
-            { [ "$(uname -m)" = "aarch64" ] && [ "$arch_wim" = arm64 ]; }
-    }; then
-        error_and_exit "The machine is $(uname -m), but the iso is $arch_wim."
-    fi
 
     add_drivers() {
         info "Add drivers"
@@ -4620,11 +4636,17 @@ install_windows() {
                     fi
                 done
             fi
-        done
 
-        [ "$arch_wim" = x86 ] && gvnic_suffix=-32 || gvnic_suffix=
-        cp_drivers $drv/gce/gvnic -ipath "*/win$nt_ver$gvnic_suffix/*"
-        cp_drivers $drv/gce/gga -ipath "*/win$nt_ver/*"
+            case "$name" in
+            gvnic)
+                [ "$arch_wim" = x86 ] && suffix=-32 || suffix=
+                cp_drivers $drv/gce/gvnic -ipath "*/win$nt_ver$suffix/*"
+                ;;
+            gga)
+                cp_drivers $drv/gce/gga -ipath "*/win$nt_ver/*"
+                ;;
+            esac
+        done
     }
 
     # azure
@@ -4696,7 +4718,6 @@ install_windows() {
     # 挂载 boot.wim
     info "mount boot.wim"
     mkdir -p /wim
-    boot_index=$(get_boot_wim_prop 'Boot Index')
     wimmountrw /os/boot.wim "$boot_index" /wim/
 
     cp_drivers() {
@@ -5020,7 +5041,7 @@ trans() {
             create_part
             download_qcow
             case "$distro" in
-            centos | alma | rocky | oracle | redhat | anolis | opencloudos | openeuler)
+            centos | almalinux | rocky | oracle | redhat | anolis | opencloudos | openeuler)
                 # 这几个系统云镜像系统盘是8~9g xfs，而我们的目标是能在5g硬盘上运行，因此改成复制系统文件
                 install_qcow_by_copy
                 ;;
@@ -5075,7 +5096,7 @@ trans() {
             create_part
             mount_part_for_iso_installer
             case "$distro" in
-            centos | alma | rocky | fedora | ubuntu | redhat) install_redhat_ubuntu ;;
+            centos | almalinux | rocky | fedora | ubuntu | redhat) install_redhat_ubuntu ;;
             windows) install_windows ;;
             esac
             ;;
