@@ -386,7 +386,7 @@ mod_motd() {
         cp $file $file.orig
         # shellcheck disable=SC2016
         echo "mv "\$mnt$file.orig" "\$mnt$file"" |
-            insert_into_file /sbin/setup-disk before 'cleanup_chroot_mounts "\$mnt"'
+            insert_into_file "$(which setup-disk)" before 'cleanup_chroot_mounts "\$mnt"'
 
         cat <<EOF >$file
 Reinstalling...
@@ -1130,10 +1130,17 @@ EOF
 install_alpine() {
     info "install alpine"
 
-    hack_lowram_modloop=true
-    hack_lowram_swap=true
+    need_ram=512
+    swap_size=$(get_need_swap_size $need_ram)
+    [ "$swap_size" -gt 0 ] && hack_lowram=true || hack_lowram=false
 
-    if $hack_lowram_modloop; then
+    # alpine 安装时会自动检测安装需要的 firmware
+    # https://github.com/alpinelinux/alpine-conf/blob/3.18.1/setup-disk.in#L421
+    # 但如果没有 modloop 则无法检测
+    # 所以删除 modloop 前先记录用到的 firmware 包
+    fw_pkgs=$(get_alpine_firmware_pkgs)
+
+    if $hack_lowram; then
         # 预先加载需要的模块
         if rc-service -q modloop status; then
             modules="ext4 vfat nls_utf8 nls_cp437"
@@ -1156,8 +1163,8 @@ install_alpine() {
     mount_part_basic_layout /os /os/boot/efi
 
     # 创建 swap
-    if $hack_lowram_swap; then
-        create_swap 256 /os/swapfile
+    if $hack_lowram; then
+        create_swap $swap_size /os/swapfile
     fi
 
     # 网络配置
@@ -1175,7 +1182,7 @@ install_alpine() {
     rc-update add hwclock boot
 
     # 通过 setup-alpine 安装会启用以下几个服务
-    # https://github.com/alpinelinux/alpine-conf/blob/c5131e9a038b09881d3d44fb35e86851e406c756/setup-alpine.in#L189
+    # https://github.com/alpinelinux/alpine-conf/blob/3.18.1/setup-alpine.in#L229
 
     # boot
     rc-update add networking boot
@@ -1205,7 +1212,7 @@ install_alpine() {
     # 防止部分机器不会 fallback 到 bootx64.efi
     if is_efi; then
         apk add efibootmgr
-        sed -i 's/--no-nvram//' /sbin/setup-disk
+        sed -i 's/--no-nvram//' "$(which setup-disk)"
     fi
 
     # 安装到硬盘
@@ -1215,13 +1222,20 @@ install_alpine() {
     export BOOTLOADER="grub"
     setup-disk -m sys -k $kernel_flavor /os
 
+    # 删除 setup-disk 时自动安装的包
+    apk del e2fsprogs dosfstools efibootmgr grub*
+
     # 安装到硬盘后才安装各种应用
     # 避免占用 Live OS 内存
 
     # 网络
-    # 坑1 udhcpc下，ip -4 addr 无法知道是否是 dhcp
-    # 坑2 udhcpc不支持dhcpv6
-    # 坑3 dhcpcd的slaac默认开了隐私保护，造成ip和后台面板不一致
+    # udhcpc
+    # 坑1 ip -4 addr 无法知道是否是 dhcp
+    # 坑2 networking 服务不会运行 udhcpc6
+    # 坑3 h3c 移动云电脑 udhcpc6 无法获取 dhcpv6
+
+    # dhcpcd
+    # 坑1 slaac默认开了隐私保护，造成ip和后台面板不一致
 
     # slaac方案1: udhcpc + rdnssd
     # slaac方案2: dhcpcd + 关闭隐私保护
@@ -1242,28 +1256,26 @@ install_alpine() {
     chroot /os setup-timezone -i Asia/Shanghai
     chroot /os setup-ntp chrony || true
 
-    # 安装固件微码
-    # shellcheck disable=SC2046
-    if is_need_ucode_firmware; then
-        chroot /os apk add $(get_ucode_firmware_pkgs)
+    # 安装固件微码会触发 grub-probe
+    # 如果没挂载会报错
+    # Executing grub-2.12-r5.trigger
+    # /usr/sbin/grub-probe: error: failed to get canonical path of `/dev/vda1'.
+    # ERROR: grub-2.12-r5.trigger: script exited with error 1
+    mount_pseudo_fs /os
+
+    # setup-disk 会自动选择固件，但不包括微码？
+    # https://github.com/alpinelinux/alpine-conf/blob/3.18.1/setup-disk.in#L421
+    if fw_pkgs="$fw_pkgs $(get_ucode_firmware_pkgs)" && [ -n "$fw_pkgs" ]; then
+        chroot /os apk add $fw_pkgs
     fi
 
     # 3.19 或以上，非 efi 需要手动安装 grub
     if ! is_efi; then
-        grub-install --boot-directory=/os/boot --target=i386-pc /dev/$xda
+        chroot /os grub-install --target=i386-pc /dev/$xda
     fi
 
     # efi grub 添加 fwsetup 条目
-    if is_efi; then
-        mount_pseudo_fs /os
-        chroot /os update-grub
-    fi
-
-    # 删除 chroot 历史记录
-    rm -rf /os/root/.ash_history
-
-    # 关闭 swap 前删除应用，避免占用内存
-    apk del e2fsprogs dosfstools grub*
+    chroot /os update-grub
 
     # 是否保留 swap
     if [ -e /os/swapfile ]; then
@@ -1331,7 +1343,9 @@ install_nixos() {
 
     # 挂载分区，创建 swapfile
     mount_part_basic_layout /os /os/efi
-    create_swap $swap_size /os/swapfile
+    if [ "$swap_size" -gt 0 ]; then
+        create_swap "$swap_size" /os/swapfile
+    fi
 
     # 步骤
     # 1. 安装 nix (nix-xxx)
@@ -1438,7 +1452,7 @@ install_nixos() {
     # TODO: 准确匹配网卡，添加 udev 或者直接配置 networkd 匹配 mac
     create_nixos_network_config /tmp/nixos_network_config.nix
 
-    add_space 2 <<EOF | del_empty_lines | add_newline both |
+    del_empty_lines <<EOF | add_space 2 | add_newline both |
 ############### Add by reinstall.sh ###############
 $nix_bootloader
 $nix_swap
@@ -1597,9 +1611,8 @@ EOF
         fi
 
         # firmware + microcode
-        if is_need_ucode_firmware; then
-            # shellcheck disable=SC2046
-            chroot $os_dir pacman -Syu --noconfirm $(get_ucode_firmware_pkgs)
+        if fw_pkgs=$(get_ucode_firmware_pkgs) && [ -n "$fw_pkgs" ]; then
+            chroot $os_dir pacman -Syu --noconfirm $fw_pkgs
         fi
 
         # arm 的内核有多种选择，默认是 linux-aarch64，所以要添加 --noconfirm
@@ -1715,9 +1728,8 @@ EOF
         fi
 
         # firmware + microcode
-        if is_need_ucode_firmware; then
-            # shellcheck disable=SC2046
-            chroot $os_dir emerge $(get_ucode_firmware_pkgs)
+        if fw_pkgs=$(get_ucode_firmware_pkgs) && [ -n "$fw_pkgs" ]; then
+            chroot $os_dir emerge $fw_pkgs
         fi
 
         # 安装 grub + 内核
@@ -1959,11 +1971,12 @@ create_part() {
     elif is_use_cloud_image; then
         installer_part_size="$(get_cloud_image_part_size)"
         # 这几个系统不使用dd，而是复制文件
-        if [ "$distro" = centos ] || [ "$distro" = alma ] || [ "$distro" = rocky ] ||
+        if [ "$distro" = centos ] || [ "$distro" = almalinux ] || [ "$distro" = rocky ] ||
             [ "$distro" = oracle ] || [ "$distro" = redhat ] ||
             [ "$distro" = anolis ] || [ "$distro" = opencloudos ] || [ "$distro" = openeuler ] ||
             [ "$distro" = ubuntu ]; then
-            fs="$(get_os_fs)"
+            # 这里的 fs 没有用，最终使用目标系统的格式化工具
+            fs=ext4
             if is_efi; then
                 parted /dev/$xda -s -- \
                     mklabel gpt \
@@ -2134,6 +2147,8 @@ get_yq_name() {
 
 create_cloud_init_network_config() {
     ci_file=$1
+    recognize_static6=${2:-true}
+    recognize_ipv6_types=${3:-true}
 
     info "Create Cloud Init network config"
 
@@ -2176,6 +2191,7 @@ create_cloud_init_network_config() {
             # 旧版 cloud-init 有 bug
             # 有的版本会只从第一种配置中读取 dns，有的从第二种读取
             # 因此写两种配置
+            # https://github.com/canonical/cloud-init/commit/1b8030e0c7fd6fbff7e38ad1e3e6266ae50c83a5
             for cur in $(get_current_dns 4); do
                 yq -i ".network.config[$config_id].subnets[$subnet_id].dns_nameservers += [\"$cur\"]" $ci_file
             done
@@ -2189,32 +2205,32 @@ create_cloud_init_network_config() {
 
         # ipv6
         if is_slaac; then
-            if is_enable_other_flag; then
-                type=ipv6_dhcpv6-stateless
+            if $recognize_ipv6_types; then
+                if is_enable_other_flag; then
+                    type=ipv6_dhcpv6-stateless
+                else
+                    type=ipv6_slaac
+                fi
             else
-                type=ipv6_slaac
+                type=dhcp6
             fi
             yq -i ".network.config[$config_id].subnets[$subnet_id] = {\"type\": \"$type\"}" $ci_file
 
         elif is_dhcpv6; then
-            yq -i ".network.config[$config_id].subnets[$subnet_id] = {\"type\": \"ipv6_dhcpv6-stateful\"}" $ci_file
+            if $recognize_ipv6_types; then
+                type=ipv6_dhcpv6-stateful
+            else
+                type=dhcp6
+            fi
+            yq -i ".network.config[$config_id].subnets[$subnet_id] = {\"type\": \"$type\"}" $ci_file
 
         elif is_staticv6; then
             get_netconf_to ipv6_addr
             get_netconf_to ipv6_gateway
-            # el7 不认识 static6，但可改成 static，作用相同
-            # >=20.1 修复
-            # https://github.com/canonical/cloud-init/commit/dacdd30080bd8183d1f1c1dc9dbcbc8448301529
-            # anolis 7:        cloud-init 19.1
-            # openeuler 20.03: cloud-init 19.4
-            # shellcheck disable=SC2154
-            if { [ "$distro" = centos ] && [ "$releasever" = 7 ]; } ||
-                { [ "$distro" = oracle ] && [ "$releasever" = 7 ]; } ||
-                { [ "$distro" = anolis ] && [ "$releasever" = 7 ]; } ||
-                { [ "$distro" = openeuler ] && [ "$releasever" = 20.03 ]; }; then
-                type_ipv6_static=static
-            else
+            if $recognize_static6; then
                 type_ipv6_static=static6
+            else
+                type_ipv6_static=static
             fi
             yq -i ".network.config[$config_id].subnets[$subnet_id] = {
                     \"type\": \"$type_ipv6_static\",
@@ -2271,6 +2287,8 @@ clear_machine_id() {
 
 download_cloud_init_config() {
     os_dir=$1
+    recognize_static6=$2
+    recognize_ipv6_types=$3
 
     ci_file=$os_dir/etc/cloud/cloud.cfg.d/99_fallback.cfg
     download $confhome/cloud-init.yaml $ci_file
@@ -2312,8 +2330,7 @@ EOF
         fi
     fi
 
-    create_cloud_init_network_config $ci_file
-    cat -n $ci_file
+    create_cloud_init_network_config "$ci_file" "$recognize_static6" "$recognize_ipv6_types"
 }
 
 modify_windows() {
@@ -2466,20 +2483,39 @@ restore_resolv_conf() {
     fi
 }
 
-is_need_ucode_firmware() {
-    ! is_virt && [ -n "$(get_ucode_firmware_pkgs)" ]
+# 抄 https://github.com/alpinelinux/alpine-conf/blob/3.18.1/setup-disk.in#L421
+get_alpine_firmware_pkgs() {
+    # 需要有 modloop，不然 modinfo 会报错
+    ensure_service_started modloop >&2
+
+    # 如果不在单独的文件夹，则用 linux-firmware-other
+    # 如果在单独的文件夹，则用 linux-firmware-xxx
+    # 如果不需要 firmware，则用 linux-firmware-none
+    firmware_pkgs=$(
+        cd /sys/module && modinfo -F firmware -- * 2>/dev/null |
+            awk -F/ '{print $1 == $0 ? "linux-firmware-other" : "linux-firmware-"$1}' |
+            sort -u
+    )
+
+    # 使用 command 因为自己覆盖了 apk 添加了 >&2
+    retry 5 command apk search --quiet --exact ${firmware_pkgs:-linux-firmware-none}
 }
 
 get_ucode_firmware_pkgs() {
+    is_virt && return
+
     case "$distro" in
-    centos | alma | rocky | oracle | redhat | anolis | opencloudos | openeuler) os=elol ;;
+    centos | almalinux | rocky | oracle | redhat | anolis | opencloudos | openeuler) os=elol ;;
     *) os=$distro ;;
     esac
 
     case "$os-$(get_cpu_vendor)" in
-    alpine-intel) echo linux-firmware linux-firmware-intel intel-ucode ;;
-    alpine-amd) echo linux-firmware linux-firmware-amd linux-firmware-amd-ucode amd-ucode ;;
-    alpine-*) echo linux-firmware ;;
+    # alpine 的 linux-firmware 以文件夹进行拆分
+    # setup-alpine 会自动安装需要的 firmware（modloop 没挂载则无效）
+    # https://github.com/alpinelinux/alpine-conf/blob/3.18.1/setup-disk.in#L421
+    alpine-intel) echo intel-ucode ;;
+    alpine-amd) echo amd-ucode ;;
+    alpine-*) ;;
 
     debian-intel) echo firmware-linux intel-microcode ;;
     debian-amd) echo firmware-linux amd64-microcode ;;
@@ -2553,10 +2589,9 @@ EOF
         cp_resolv_conf $os_dir
 
         disable_selinux_kdump $os_dir
-        if is_need_ucode_firmware; then
+        if fw_pkgs=$(get_ucode_firmware_pkgs) && [ -n "$fw_pkgs" ]; then
             is_have_cmd_on_disk $os_dir dnf && mgr=dnf || mgr=yum
-            # shellcheck disable=SC2046
-            chroot $os_dir $mgr install -y $(get_ucode_firmware_pkgs)
+            chroot $os_dir $mgr install -y $fw_pkgs
         fi
 
         restore_resolv_conf $os_dir
@@ -2625,7 +2660,7 @@ EOF
         fi
 
         # 微码+固件
-        if is_need_ucode_firmware; then
+        if fw_pkgs=$(get_ucode_firmware_pkgs) && [ -n "$fw_pkgs" ]; then
             #  debian 10 11 的 iucode-tool 在 contrib 里面
             #  debian 12 的 iucode-tool 在 main 里面
             [ "$releasever" -ge 12 ] &&
@@ -2646,8 +2681,7 @@ EOF
                 fi
             done
 
-            # shellcheck disable=SC2046
-            chroot_apt_install $os_dir $(get_ucode_firmware_pkgs)
+            chroot_apt_install $os_dir $fw_pkgs
         fi
 
         if [ "$releasever" -le 11 ]; then
@@ -2705,9 +2739,8 @@ EOF
         chroot $os_dir zypper remove -y kernel-default-base
 
         # 固件+微码
-        if is_need_ucode_firmware; then
-            # shellcheck disable=SC2046
-            chroot $os_dir zypper install -y $(get_ucode_firmware_pkgs)
+        if fw_pkgs=$(get_ucode_firmware_pkgs) && [ -n "$fw_pkgs" ]; then
+            chroot $os_dir zypper install -y $fw_pkgs
         fi
 
         # 选择新内核
@@ -2785,6 +2818,16 @@ EOF
 
         # 修复 onlink 网关
         add_onlink_script_if_need
+    fi
+
+    # 修复 cloud-init + sysconfig / NetworkManager 的各种网络问题
+    if [ -d "$os_dir/etc/sysconfig" ] || [ -d "$os_dir/etc/NetworkManager" ]; then
+        fix_sysconfig_NetworkManager $os_dir
+    fi
+
+    # 查看 cloud-init 最终配置
+    if [ -f "$ci_file" ]; then
+        cat -n "$ci_file"
     fi
 }
 
@@ -2958,16 +3001,14 @@ disable_selinux_kdump() {
     os_dir=$1
 
     # selinux
+    # https://access.redhat.com/solutions/3176
+    # centos7 也建议将 selinux 开关写在 cmdline
+    # grep selinux=0 /usr/lib/dracut/modules.d/98selinux/selinux-loadpolicy.sh
+    #     warn "To disable selinux, add selinux=0 to the kernel command line."
     if [ -f $os_dir/etc/selinux/config ]; then
         sed -i 's/^SELINUX=enforcing/SELINUX=disabled/g' $os_dir/etc/selinux/config
     fi
-
-    # https://access.redhat.com/solutions/3176
-    # shellcheck disable=SC2154
-    # openeuler 版本是 24.03
-    if [ "$distro" = openeuler ] || [ "$releasever" -ge 9 ]; then
-        chroot $os_dir grubby --update-kernel ALL --args selinux=0
-    fi
+    chroot $os_dir grubby --update-kernel ALL --args selinux=0
 
     # kdump
     # grubby 只处理 GRUB_CMDLINE_LINUX，不会处理 GRUB_CMDLINE_LINUX_DEFAULT
@@ -3030,15 +3071,6 @@ disconnect_qcow() {
             sleep 5
         done
     fi
-}
-
-get_os_fs() {
-    case "$distro" in
-    ubuntu) echo ext4 ;;
-    anolis | openeuler) echo ext4 ;;
-    centos | alma | rocky | oracle | redhat) echo xfs ;;
-    opencloudos) echo xfs ;;
-    esac
 }
 
 get_cloud_image_part_size() {
@@ -3146,15 +3178,35 @@ del_default_user() {
     done < <(grep -v nologin$ "$os_dir/etc/passwd" | cut -d: -f1 | grep -v root)
 }
 
+is_el7_family() {
+    is_have_cmd_on_disk "$1" yum &&
+        ! is_have_cmd_on_disk "$1" dnf
+}
+
+fix_sysconfig_NetworkManager() {
+    os_dir=$1
+    ci_file=$os_dir/etc/cloud/cloud.cfg.d/99_fallback.cfg
+
+    # 删除云镜像自带的 dhcp 配置，防止歧义
+    rm -rf $os_dir/etc/NetworkManager/system-connections/*.nmconnection
+    rm -rf $os_dir/etc/sysconfig/network-scripts/ifcfg-*
+
+    # 1. 修复 cloud-init 添加了 IPV*_FAILURE_FATAL / may-fail=false
+    #    甲骨文 dhcpv6 获取不到 IP 将视为 fatal，原有的 ipv4 地址也会被删除
+    # 2. 修复 dhcpv6 下，ifcfg 添加了 IPV6_AUTOCONF=no 导致无法获取网关
+    # 3. 修复 dhcpv6 下，NM method=dhcp 导致无法获取网关
+
+    insert_into_file $ci_file after '^runcmd:' <<EOF
+  - sed -i '/^IPV[46]_FAILURE_FATAL=/d' /etc/sysconfig/network-scripts/ifcfg-* || true
+  - sed -i '/^may-fail=/d' /etc/NetworkManager/system-connections/*.nmconnection || true
+  - for f in /etc/sysconfig/network-scripts/ifcfg-*; do grep -q '^DHCPV6C=yes' "\$f" && sed -i '/^IPV6_AUTOCONF=no/d' "\$f"; done
+  - sed -i 's/^method=dhcp/method=auto/' /etc/NetworkManager/system-connections/*.nmconnection || true
+  - systemctl is-enabled NetworkManager && systemctl restart NetworkManager || true
+EOF
+}
+
 install_qcow_by_copy() {
     info "Install qcow2 by copy"
-
-    mount_nouuid() {
-        case "$(get_os_fs)" in
-        ext4) mount "$@" ;;
-        xfs) mount -o nouuid "$@" ;;
-        esac
-    }
 
     efi_mount_opts=$(
         case "$distro" in
@@ -3166,9 +3218,10 @@ install_qcow_by_copy() {
     connect_qcow
 
     # 镜像分区格式
-    # centos/rocky/alma/rhel: xfs
+    # centos/rocky/almalinux/rhel: xfs
     # oracle x86_64:          lvm + xfs
     # oracle aarch64 cloud:   xfs
+    # alibaba cloud linux 3:  ext4
 
     is_lvm_image=false
     if lsblk -f /dev/nbd0p* | grep LVM2_member; then
@@ -3184,7 +3237,7 @@ install_qcow_by_copy() {
     os_part=$(lsblk /dev/nbd0p* --sort SIZE -no NAME,FSTYPE | grep -E 'ext4|xfs' | tail -1 | awk '{print $1}')
     efi_part=$(lsblk /dev/nbd0p* --sort SIZE -no NAME,PARTTYPE | grep -i "$EFI_UUID" | awk '{print $1}')
     # 排除前两个，再选择最大分区
-    # alma 9 boot 分区的类型不是规定的 uuid
+    # almalinux9 boot 分区的类型不是规定的 uuid
     # openeuler boot 分区是 fat 格式
     boot_part=$(lsblk /dev/nbd0p* --sort SIZE -no NAME,FSTYPE | grep -E 'ext4|xfs|fat' | awk '{print $1}' |
         grep -vx "$os_part" | grep -vx "$efi_part" | tail -1 | awk '{print $1}')
@@ -3208,6 +3261,7 @@ install_qcow_by_copy() {
     # read -r os_part_uuid os_part_label < <(lsblk /dev/$os_part -no UUID,LABEL)
     os_part_uuid=$(lsblk /dev/$os_part -no UUID)
     os_part_label=$(lsblk /dev/$os_part -no LABEL)
+    os_part_fstype=$(lsblk /dev/$os_part -no FSTYPE)
 
     if [ -n "$efi_part" ]; then
         efi_part_uuid=$(lsblk /dev/$efi_part -no UUID)
@@ -3216,11 +3270,18 @@ install_qcow_by_copy() {
 
     mkdir -p /nbd /nbd-boot /nbd-efi
 
+    mount_nouuid() {
+        case "$os_part_fstype" in
+        ext4) mount "$@" ;;
+        xfs) mount -o nouuid "$@" ;;
+        esac
+    }
+
     # 使用目标系统的格式化程序
     # centos8 如果用alpine格式化xfs，grub2-mkconfig和grub2里面都无法识别xfs分区
     mount_nouuid /dev/$os_part /nbd/
     mount_pseudo_fs /nbd/
-    case "$(get_os_fs)" in
+    case "$os_part_fstype" in
     ext4) chroot /nbd mkfs.ext4 -F -L "$os_part_label" -U "$os_part_uuid" /dev/$xda*2 ;;
     xfs) chroot /nbd mkfs.xfs -f -L "$os_part_label" -m uuid=$os_part_uuid /dev/$xda*2 ;;
     esac
@@ -3307,55 +3368,45 @@ install_qcow_by_copy() {
         # selinux kdump
         disable_selinux_kdump /os
 
-        # centos7 删除 machine-id 后不会自动重建
+        # el7 删除 machine-id 后不会自动重建
         clear_machine_id /os
 
-        # el7 yum 可能会使用 ipv6，即使没有 ipv6 网络
-        if [ "$releasever" = 7 ]; then
+        # el7 forks 特殊处理
+        if is_el7_family /os; then
+            # centos 7 eol 换源
+            if [ -f /os/etc/yum.repos.d/CentOS-Base.repo ]; then
+                # 保持默认的 http 因为自带的 ssl 证书可能过期
+                if is_in_china; then
+                    mirror=mirror.nju.edu.cn/centos-vault
+                else
+                    mirror=vault.centos.org
+                fi
+                sed -Ei -e 's,(mirrorlist=),#\1,' \
+                    -e "s,#(baseurl=http://)mirror.centos.org,\1$mirror," /os/etc/yum.repos.d/CentOS-Base.repo
+            fi
+
+            # el7 yum 可能会使用 ipv6，即使没有 ipv6 网络
             if [ "$(cat /dev/netconf/eth*/ipv6_has_internet | sort -u)" = 0 ]; then
                 echo 'ip_resolve=4' >>/os/etc/yum.conf
             fi
-        fi
 
-        # centos 7 eol 特殊处理
-        if [ "$releasever" = 7 ] && [ -f /os/etc/yum.repos.d/CentOS-Base.repo ]; then
-            # 保持默认的 http 因为自带的 ssl 证书可能过期
-            if is_in_china; then
-                mirror=mirror.nju.edu.cn/centos-vault
-            else
-                mirror=vault.centos.org
-            fi
-            sed -Ei -e 's,(mirrorlist=),#\1,' \
-                -e "s,#(baseurl=http://)mirror.centos.org,\1$mirror," /os/etc/yum.repos.d/CentOS-Base.repo
+            # el7 安装 NetworkManager
+            # anolis 7 镜像自带 NetworkManager
+            chroot_dnf install NetworkManager
+            chroot /os systemctl disable network
+            chroot /os systemctl enable NetworkManager
         fi
 
         # firmware + microcode
-        if is_need_ucode_firmware; then
-            # shellcheck disable=SC2046
-            chroot_dnf install $(get_ucode_firmware_pkgs)
+        if fw_pkgs=$(get_ucode_firmware_pkgs) && [ -n "$fw_pkgs" ]; then
+            chroot_dnf install $fw_pkgs
         fi
 
-        # centos 7 安装 NetworkManager
-        if [ "$releasever" = 7 ]; then
-            chroot_dnf install NetworkManager
-        fi
-        # anolis 7 镜像自带 nm
-
-        # 删除云镜像自带的 dhcp 配置，防止歧义
-        # clout-init 网络配置在 /etc/sysconfig/network-scripts/
-        rm -rf /os/etc/NetworkManager/system-connections/*.nmconnection
-        rm -rf /os/etc/sysconfig/network-scripts/ifcfg-*
-
-        # 修复 cloud-init 添加了 IPV*_FAILURE_FATAL
-        # 甲骨文 dhcp6 获取不到 IP 将视为 fatal，原有的 ipv4 地址也会被删除
-        insert_into_file $ci_file after '^runcmd:' <<EOF
-  - sed -i '/IPV4_FAILURE_FATAL/d' /etc/sysconfig/network-scripts/ifcfg-* || true
-  - sed -i '/IPV6_FAILURE_FATAL/d' /etc/sysconfig/network-scripts/ifcfg-* || true
-  - systemctl restart NetworkManager
-EOF
+        # 修复 cloud-init + dhcp 的各种网络问题
+        fix_sysconfig_NetworkManager /os
 
         # fstab 删除多余分区
-        # alma/rocky 镜像有 boot 分区
+        # almalinux/rocky 镜像有 boot 分区
         # oracle 镜像有 swap 分区
         sed -i '/[[:space:]]\/boot[[:space:]]/d' /os/etc/fstab
         sed -i '/[[:space:]]swap[[:space:]]/d' /os/etc/fstab
@@ -3422,7 +3473,7 @@ EOF
         fi
 
         # blscfg 启动项
-        # rocky/alma镜像是独立的boot分区，但我们不是
+        # rocky/almalinux镜像是独立的boot分区，但我们不是
         # 因此要添加boot目录
         if ls /os/boot/loader/entries/*.conf 2>/dev/null &&
             ! grep -q 'initrd /boot/' /os/boot/loader/entries/*.conf; then
@@ -3525,9 +3576,8 @@ EOF
         fi
 
         # 安装固件+微码
-        if is_need_ucode_firmware; then
-            # shellcheck disable=SC2046
-            chroot_apt_install $os_dir $(get_ucode_firmware_pkgs)
+        if fw_pkgs=$(get_ucode_firmware_pkgs) && [ -n "$fw_pkgs" ]; then
+            chroot_apt_install $os_dir $fw_pkgs
         fi
 
         # 16.04 镜像用 ifupdown/networking 管理网络
@@ -3598,8 +3648,41 @@ EOF
         restore_resolv_conf $os_dir
     fi
 
+    # cloud-init 路径
+    # /usr/lib/python2.7/site-packages/cloudinit/net/
+    # /usr/lib/python3/dist-packages/cloudinit/net/
+    # /usr/lib/python3.9/site-packages/cloudinit/net/
+
+    # el7 不认识 static6，但可改成 static，作用相同
+    recognize_static6=true
+    if ls $os_dir/usr/lib/python*/*-packages/cloudinit/net/sysconfig.py 2>/dev/null &&
+        ! grep -q static6 $os_dir/usr/lib/python*/*-packages/cloudinit/net/sysconfig.py; then
+        recognize_static6=false
+    fi
+
+    # cloud-init 20.1 才支持以下配置
+    # https://cloudinit.readthedocs.io/en/20.4/topics/network-config-format-v1.html#subnet-ip
+    # https://cloudinit.readthedocs.io/en/21.1/topics/network-config-format-v1.html#subnet-ip
+    # ipv6_dhcpv6-stateful: Configure this interface with dhcp6
+    # ipv6_dhcpv6-stateless: Configure this interface with SLAAC and DHCP
+    # ipv6_slaac: Configure address with SLAAC
+
+    # el7 最新 cloud-init 版本
+    # centos 7         19.4-7.0.5.el7_9.6  backport 了 ipv6_xxx
+    # openeuler 20.03  19.4-15.oe2003sp4   backport 了 ipv6_xxx
+    # anolis 7         19.1.17-1.0.1.an7   没有更新到 centos7 相同版本,也没 backport ipv6_xxx，坑
+
+    # 最好还修改 ifcfg-eth* 的 IPV6_AUTOCONF
+    # 但实测 anolis7 cloud-init dhcp6 不会生成 IPV6_AUTOCONF，因此暂时不管
+    # https://www.redhat.com/zh/blog/configuring-ipv6-rhel-7-8
+    recognize_ipv6_types=true
+    if ls -d $os_dir/usr/lib/python*/*-packages/cloudinit/net/ 2>/dev/null &&
+        ! grep -qr ipv6_slaac $os_dir/usr/lib/python*/*-packages/cloudinit/net/; then
+        recognize_ipv6_types=false
+    fi
+
     # cloud-init
-    download_cloud_init_config $os_dir
+    download_cloud_init_config "$os_dir" "$recognize_static6" "$recognize_ipv6_types"
 
     case "$distro" in
     ubuntu) modify_ubuntu ;;
@@ -4049,6 +4132,21 @@ get_filesize_mb() {
 }
 
 install_windows() {
+    get_wim_prop() {
+        wim=$1
+        property=$2
+
+        wiminfo "$wim" | grep -i "^$property:" | cut -d: -f2- | xargs
+    }
+
+    get_image_prop() {
+        wim=$1
+        index=$2
+        property=$3
+
+        wiminfo "$wim" "$index" | grep -i "^$property:" | cut -d: -f2- | xargs
+    }
+
     info "Process windows iso"
 
     apk add wimlib
@@ -4056,6 +4154,17 @@ install_windows() {
     download $iso /os/windows.iso
     mkdir -p /iso
     mount -o ro /os/windows.iso /iso
+
+    # 防止用了不兼容架构的 iso
+    boot_index=$(get_wim_prop /iso/sources/boot.wim 'Boot Index')
+    arch_wim=$(get_image_prop /iso/sources/boot.wim "$boot_index" 'Architecture' | to_lower)
+    if ! {
+        { [ "$(uname -m)" = "x86_64" ] && [ "$arch_wim" = x86_64 ]; } ||
+            { [ "$(uname -m)" = "x86_64" ] && [ "$arch_wim" = x86 ]; } ||
+            { [ "$(uname -m)" = "aarch64" ] && [ "$arch_wim" = arm64 ]; }
+    }; then
+        error_and_exit "The machine is $(uname -m), but the iso is $arch_wim."
+    fi
 
     if [ -e /iso/sources/install.esd ]; then
         iso_install_wim=/iso/sources/install.esd
@@ -4101,14 +4210,8 @@ install_windows() {
         done
     fi
 
-    get_boot_wim_prop() {
-        property=$1
-        wiminfo "/os/boot.wim" | grep -i "^$property:" | cut -d: -f2- | xargs
-    }
-
     get_selected_image_prop() {
-        property=$1
-        wiminfo "$iso_install_wim" "$image_name" | grep -i "^$property:" | cut -d: -f2- | xargs
+        get_image_prop "$iso_install_wim" "$image_name" "$1"
     }
 
     # PRODUCTTYPE:
@@ -4215,7 +4318,6 @@ install_windows() {
     # arch_dd    华为云驱动                   32   64
 
     # 将 wim 的 arch 转为驱动和应答文件的 arch
-    arch_wim=$(get_selected_image_prop Architecture | to_lower)
     case "$arch_wim" in
     x86)
         arch=x86
@@ -4233,15 +4335,6 @@ install_windows() {
         arch_dd=  # 华为云没有 arm64 驱动
         ;;
     esac
-
-    # 防止用了不兼容架构的 iso
-    if ! {
-        { [ "$(uname -m)" = "x86_64" ] && [ "$arch_wim" = x86_64 ]; } ||
-            { [ "$(uname -m)" = "x86_64" ] && [ "$arch_wim" = x86 ]; } ||
-            { [ "$(uname -m)" = "aarch64" ] && [ "$arch_wim" = arm64 ]; }
-    }; then
-        error_and_exit "The machine is $(uname -m), but the iso is $arch_wim."
-    fi
 
     add_drivers() {
         info "Add drivers"
@@ -4620,11 +4713,17 @@ install_windows() {
                     fi
                 done
             fi
-        done
 
-        [ "$arch_wim" = x86 ] && gvnic_suffix=-32 || gvnic_suffix=
-        cp_drivers $drv/gce/gvnic -ipath "*/win$nt_ver$gvnic_suffix/*"
-        cp_drivers $drv/gce/gga -ipath "*/win$nt_ver/*"
+            case "$name" in
+            gvnic)
+                [ "$arch_wim" = x86 ] && suffix=-32 || suffix=
+                cp_drivers $drv/gce/gvnic -ipath "*/win$nt_ver$suffix/*"
+                ;;
+            gga)
+                cp_drivers $drv/gce/gga -ipath "*/win$nt_ver/*"
+                ;;
+            esac
+        done
     }
 
     # azure
@@ -4696,7 +4795,6 @@ install_windows() {
     # 挂载 boot.wim
     info "mount boot.wim"
     mkdir -p /wim
-    boot_index=$(get_boot_wim_prop 'Boot Index')
     wimmountrw /os/boot.wim "$boot_index" /wim/
 
     cp_drivers() {
@@ -5020,7 +5118,7 @@ trans() {
             create_part
             download_qcow
             case "$distro" in
-            centos | alma | rocky | oracle | redhat | anolis | opencloudos | openeuler)
+            centos | almalinux | rocky | oracle | redhat | anolis | opencloudos | openeuler)
                 # 这几个系统云镜像系统盘是8~9g xfs，而我们的目标是能在5g硬盘上运行，因此改成复制系统文件
                 install_qcow_by_copy
                 ;;
@@ -5075,7 +5173,7 @@ trans() {
             create_part
             mount_part_for_iso_installer
             case "$distro" in
-            centos | alma | rocky | fedora | ubuntu | redhat) install_redhat_ubuntu ;;
+            centos | almalinux | rocky | fedora | ubuntu | redhat) install_redhat_ubuntu ;;
             windows) install_windows ;;
             esac
             ;;
